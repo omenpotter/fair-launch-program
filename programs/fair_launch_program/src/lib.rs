@@ -1,0 +1,692 @@
+use anchor_lang::prelude::*;
+use anchor_spl::token::{self, Mint, Token, TokenAccount, MintTo, Transfer, Burn};
+
+declare_id!("2NWX2Tn5ywkAEUiHxPm5Y28vQAghrDzHcMe78fv2NYye"); // Will be replaced after build
+
+#[program]
+pub mod fair_launch_program {
+    use super::*;
+
+    /// Initialize platform config (one-time, admin only)
+    pub fn initialize_platform_config(
+        ctx: Context<InitializePlatformConfig>,
+    ) -> Result<()> {
+        let config = &mut ctx.accounts.platform_config;
+        
+        config.admin = ctx.accounts.admin.key();
+        
+        // Initial values (XNT = $1)
+        config.mint_price = 14_040; // 0.00001404 XNT in lamports
+        config.target_xnt = 11_232_000_000_000; // 11,232 XNT in lamports
+        config.creation_fee = 1_000_000_000; // 1 XNT in lamports
+        
+        // Safety limits (10x range)
+        config.min_mint_price = 1_404; // 10x lower
+        config.max_mint_price = 140_400; // 10x higher
+        config.min_target_xnt = 1_123_200_000_000; // 10x lower
+        config.max_target_xnt = 112_320_000_000_000; // 10x higher
+        config.min_creation_fee = 100_000_000; // 0.1 XNT
+        config.max_creation_fee = 10_000_000_000; // 10 XNT
+        
+        config.bump = ctx.bumps.platform_config;
+        
+        msg!("Platform config initialized");
+        msg!("Admin: {}", config.admin);
+        msg!("Mint price: {} lamports", config.mint_price);
+        msg!("Target XNT: {} lamports", config.target_xnt);
+        
+        Ok(())
+    }
+
+    /// Update platform config (admin only)
+    pub fn update_platform_config(
+        ctx: Context<UpdatePlatformConfig>,
+        new_mint_price: Option<u64>,
+        new_target_xnt: Option<u64>,
+        new_creation_fee: Option<u64>,
+    ) -> Result<()> {
+        let config = &mut ctx.accounts.platform_config;
+        
+        // Validate admin
+        require!(
+            ctx.accounts.admin.key() == config.admin,
+            ErrorCode::Unauthorized
+        );
+        
+        // Update mint_price if provided
+        if let Some(price) = new_mint_price {
+            require!(
+                price >= config.min_mint_price && price <= config.max_mint_price,
+                ErrorCode::PriceOutOfRange
+            );
+            
+            let old_price = config.mint_price;
+            config.mint_price = price;
+            
+            msg!("Mint price updated: {} -> {} lamports", old_price, price);
+        }
+        
+        // Update target_xnt if provided
+        if let Some(target) = new_target_xnt {
+            require!(
+                target >= config.min_target_xnt && target <= config.max_target_xnt,
+                ErrorCode::TargetOutOfRange
+            );
+            
+            let old_target = config.target_xnt;
+            config.target_xnt = target;
+            
+            msg!("Target XNT updated: {} -> {} lamports", old_target, target);
+        }
+        
+        // Update creation_fee if provided
+        if let Some(fee) = new_creation_fee {
+            require!(
+                fee >= config.min_creation_fee && fee <= config.max_creation_fee,
+                ErrorCode::FeeOutOfRange
+            );
+            
+            let old_fee = config.creation_fee;
+            config.creation_fee = fee;
+            
+            msg!("Creation fee updated: {} -> {} lamports", old_fee, fee);
+        }
+        
+        emit!(ConfigUpdatedEvent {
+            admin: config.admin,
+            mint_price: config.mint_price,
+            target_xnt: config.target_xnt,
+            creation_fee: config.creation_fee,
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+        
+        Ok(())
+    }
+
+    /// Initialize a new fair launch token
+    pub fn initialize(
+        ctx: Context<Initialize>,
+        name: String,
+        symbol: String,
+        max_per_wallet: u64,
+    ) -> Result<()> {
+        require!(max_per_wallet >= 1_000 && max_per_wallet <= 100_000, ErrorCode::InvalidMaxPerWallet);
+        require!(name.len() <= 32, ErrorCode::NameTooLong);
+        require!(symbol.len() <= 10, ErrorCode::SymbolTooLong);
+        
+        let config = &ctx.accounts.platform_config;
+        let fair_launch = &mut ctx.accounts.fair_launch;
+        
+        fair_launch.authority = ctx.accounts.authority.key();
+        fair_launch.token_mint = ctx.accounts.token_mint.key();
+        fair_launch.name = name;
+        fair_launch.symbol = symbol;
+        
+        // FIXED token distribution (PERMANENT)
+        fair_launch.total_supply = 1_000_000_000;
+        fair_launch.public_supply = 800_000_000;  // 80%
+        fair_launch.liquidity_supply = 150_000_000; // 15%
+        fair_launch.platform_supply = 30_000_000;   // 3%
+        fair_launch.burn_supply = 20_000_000;       // 2%
+        
+        // Economics from platform config (FLEXIBLE)
+        fair_launch.mint_price = config.mint_price;
+        fair_launch.target_xnt = config.target_xnt;
+        fair_launch.max_per_wallet = max_per_wallet;
+        
+        // FIXED revenue splits (PERMANENT)
+        fair_launch.creator_xnt_percent = 5;   // 5%
+        fair_launch.platform_xnt_percent = 3;  // 3%
+        fair_launch.pool_xnt_percent = 92;     // 92%
+        
+        // Initial state
+        fair_launch.total_minted = 0;
+        fair_launch.xnt_collected = 0;
+        fair_launch.graduated = false;
+        fair_launch.pool_created = false;
+        fair_launch.xdex_pool_address = None;
+        fair_launch.bump = ctx.bumps.fair_launch;
+        
+        msg!("✅ Fair launch initialized: {} ({}) - Max/Wallet: {}", 
+            fair_launch.name, 
+            fair_launch.symbol, 
+            max_per_wallet
+        );
+        msg!("Mint price: {} lamports XNT", fair_launch.mint_price);
+        msg!("Target: {} lamports XNT", fair_launch.target_xnt);
+        
+        Ok(())
+    }
+
+    /// Mint tokens by paying XNT
+    pub fn mint_tokens(
+        ctx: Context<MintTokens>,
+        amount: u64,
+    ) -> Result<()> {
+        let fair_launch = &mut ctx.accounts.fair_launch;
+        
+        // Check if graduated
+        require!(!fair_launch.graduated, ErrorCode::AlreadyGraduated);
+        
+        // Check supply available
+        require!(
+            fair_launch.total_minted + amount <= fair_launch.public_supply,
+            ErrorCode::InsufficientSupply
+        );
+        
+        // Check per-wallet limit
+        let user_mints = &mut ctx.accounts.user_mints;
+        require!(
+            user_mints.amount_minted + amount <= fair_launch.max_per_wallet,
+            ErrorCode::ExceedsWalletLimit
+        );
+        
+        // Calculate XNT cost
+        let xnt_cost = (amount as u128)
+            .checked_mul(fair_launch.mint_price as u128)
+            .unwrap() as u64;
+        
+        // Transfer XNT from user to escrow (100% to escrow)
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.user_xnt_account.to_account_info(),
+            to: ctx.accounts.escrow_xnt_account.to_account_info(),
+            authority: ctx.accounts.user.to_account_info(),
+        };
+        let cpi_program = ctx.accounts.token_program.to_account_info();
+        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
+        token::transfer(cpi_ctx, xnt_cost)?;
+        
+        // Mint tokens to user
+        let seeds = &[
+            b"fair_launch",
+            fair_launch.token_mint.as_ref(),
+            &[fair_launch.bump],
+        ];
+        let signer = &[&seeds[..]];
+        
+        let cpi_accounts = MintTo {
+            mint: ctx.accounts.token_mint.to_account_info(),
+            to: ctx.accounts.user_token_account.to_account_info(),
+            authority: fair_launch.to_account_info(),
+        };
+        let cpi_program = ctx.accounts.token_program.to_account_info();
+        let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer);
+        token::mint_to(cpi_ctx, amount)?;
+        
+        // Update state
+        fair_launch.total_minted += amount;
+        fair_launch.xnt_collected += xnt_cost;
+        
+        user_mints.amount_minted += amount;
+        user_mints.total_spent += xnt_cost;
+        
+        // Check if should graduate
+        if fair_launch.total_minted >= fair_launch.public_supply {
+            fair_launch.graduated = true;
+            msg!("🎉 Token graduated! Total XNT collected: {} lamports", fair_launch.xnt_collected);
+            
+            // Emit graduation event for backend
+            emit!(GraduationEvent {
+                token_mint: fair_launch.token_mint,
+                total_xnt: fair_launch.xnt_collected,
+                creator: fair_launch.authority,
+                timestamp: Clock::get()?.unix_timestamp,
+            });
+        }
+        
+        msg!("Minted {} tokens for {} lamports XNT", amount, xnt_cost);
+        Ok(())
+    }
+
+    /// Graduate to XDEX - Pay creator, platform, lock platform tokens, burn tokens
+    pub fn graduate(ctx: Context<Graduate>) -> Result<()> {
+        let fair_launch = &mut ctx.accounts.fair_launch;
+        
+        require!(fair_launch.graduated, ErrorCode::NotReadyToGraduate);
+        require!(!fair_launch.pool_created, ErrorCode::AlreadyProcessed);
+        
+        // Calculate XNT splits
+        let creator_xnt = (fair_launch.xnt_collected as u128)
+            .checked_mul(fair_launch.creator_xnt_percent as u128)
+            .unwrap()
+            .checked_div(100)
+            .unwrap() as u64;
+        
+        let platform_xnt = (fair_launch.xnt_collected as u128)
+            .checked_mul(fair_launch.platform_xnt_percent as u128)
+            .unwrap()
+            .checked_div(100)
+            .unwrap() as u64;
+        
+        let pool_xnt = fair_launch.xnt_collected - creator_xnt - platform_xnt;
+        
+        let seeds = &[
+            b"fair_launch",
+            fair_launch.token_mint.as_ref(),
+            &[fair_launch.bump],
+        ];
+        let signer = &[&seeds[..]];
+        
+        // 1. Pay creator (5%)
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.escrow_xnt_account.to_account_info(),
+            to: ctx.accounts.creator_xnt_account.to_account_info(),
+            authority: fair_launch.to_account_info(),
+        };
+        let cpi_program = ctx.accounts.token_program.to_account_info();
+        let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer);
+        token::transfer(cpi_ctx, creator_xnt)?;
+        
+        // 2. Pay platform (3%)
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.escrow_xnt_account.to_account_info(),
+            to: ctx.accounts.platform_xnt_account.to_account_info(),
+            authority: fair_launch.to_account_info(),
+        };
+        let cpi_program = ctx.accounts.token_program.to_account_info();
+        let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer);
+        token::transfer(cpi_ctx, platform_xnt)?;
+        
+        // 3. Mint platform tokens (3%)
+        let cpi_accounts = MintTo {
+            mint: ctx.accounts.token_mint.to_account_info(),
+            to: ctx.accounts.platform_token_account.to_account_info(),
+            authority: fair_launch.to_account_info(),
+        };
+        let cpi_program = ctx.accounts.token_program.to_account_info();
+        let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer);
+        token::mint_to(cpi_ctx, fair_launch.platform_supply)?;
+        
+        // 4. Lock platform tokens for 90 days via Liquidity Lock CPI
+        let unlock_time = Clock::get()?.unix_timestamp + (90 * 86400); // 90 days
+        
+        // NOTE: This requires Liquidity Lock program integration
+        // For now, we emit event and lock manually
+        // TODO: Add actual CPI call when integrating with Liquidity Lock
+        msg!("Platform tokens minted: {} - Lock for 90 days until: {}", 
+            fair_launch.platform_supply, 
+            unlock_time
+        );
+        
+        // 5. Mint & burn tokens (2%)
+        let cpi_accounts = MintTo {
+            mint: ctx.accounts.token_mint.to_account_info(),
+            to: ctx.accounts.burn_token_account.to_account_info(),
+            authority: fair_launch.to_account_info(),
+        };
+        let cpi_program = ctx.accounts.token_program.to_account_info();
+        let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer);
+        token::mint_to(cpi_ctx, fair_launch.burn_supply)?;
+        
+        // Burn the tokens
+        let cpi_accounts = Burn {
+            mint: ctx.accounts.token_mint.to_account_info(),
+            from: ctx.accounts.burn_token_account.to_account_info(),
+            authority: fair_launch.to_account_info(),
+        };
+        let cpi_program = ctx.accounts.token_program.to_account_info();
+        let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer);
+        token::burn(cpi_ctx, fair_launch.burn_supply)?;
+        
+        msg!("💰 Graduation payments complete!");
+        msg!("Creator received: {} lamports XNT", creator_xnt);
+        msg!("Platform received: {} lamports XNT + {} tokens (locked 90d)", platform_xnt, fair_launch.platform_supply);
+        msg!("Burned: {} tokens", fair_launch.burn_supply);
+        msg!("Pool liquidity ready: {} lamports XNT + {} tokens", pool_xnt, fair_launch.liquidity_supply);
+        
+        // Emit event for backend to create XDEX pool
+        emit!(PoolReadyEvent {
+            token_mint: fair_launch.token_mint,
+            pool_xnt: pool_xnt,
+            pool_tokens: fair_launch.liquidity_supply,
+            creator: fair_launch.authority,
+            platform_token_unlock_time: unlock_time,
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+        
+        Ok(())
+    }
+
+    /// Mark pool as created (called by backend after XDEX pool creation)
+    pub fn mark_pool_created(
+        ctx: Context<MarkPoolCreated>,
+        pool_address: Pubkey,
+    ) -> Result<()> {
+        let fair_launch = &mut ctx.accounts.fair_launch;
+        
+        require!(fair_launch.graduated, ErrorCode::NotGraduated);
+        require!(!fair_launch.pool_created, ErrorCode::AlreadyProcessed);
+        
+        fair_launch.pool_created = true;
+        fair_launch.xdex_pool_address = Some(pool_address);
+        
+        msg!("✅ XDEX pool marked as created: {}", pool_address);
+        
+        emit!(PoolCreatedEvent {
+            token_mint: fair_launch.token_mint,
+            pool_address: pool_address,
+            timestamp: Clock::get()?.unix_timestamp,
+        });
+        
+        Ok(())
+    }
+}
+
+// ===== ACCOUNTS =====
+
+#[derive(Accounts)]
+pub struct InitializePlatformConfig<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    
+    #[account(
+        init,
+        payer = admin,
+        space = 8 + PlatformConfig::LEN,
+        seeds = [b"platform_config"],
+        bump
+    )]
+    pub platform_config: Account<'info, PlatformConfig>,
+    
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct UpdatePlatformConfig<'info> {
+    pub admin: Signer<'info>,
+    
+    #[account(
+        mut,
+        seeds = [b"platform_config"],
+        bump = platform_config.bump,
+    )]
+    pub platform_config: Account<'info, PlatformConfig>,
+}
+
+#[derive(Accounts)]
+pub struct Initialize<'info> {
+    #[account(mut)]
+    pub authority: Signer<'info>,
+    
+    #[account(
+        seeds = [b"platform_config"],
+        bump = platform_config.bump,
+    )]
+    pub platform_config: Account<'info, PlatformConfig>,
+    
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + FairLaunch::LEN,
+        seeds = [b"fair_launch", token_mint.key().as_ref()],
+        bump
+    )]
+    pub fair_launch: Account<'info, FairLaunch>,
+    
+    #[account(
+        init,
+        payer = authority,
+        mint::decimals = 9,
+        mint::authority = fair_launch,
+    )]
+    pub token_mint: Account<'info, Mint>,
+    
+    pub system_program: Program<'info, System>,
+    pub token_program: Program<'info, Token>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
+#[derive(Accounts)]
+pub struct MintTokens<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+    
+    #[account(
+        mut,
+        seeds = [b"fair_launch", token_mint.key().as_ref()],
+        bump = fair_launch.bump,
+    )]
+    pub fair_launch: Account<'info, FairLaunch>,
+    
+    #[account(mut)]
+    pub token_mint: Account<'info, Mint>,
+    
+    #[account(
+        init,
+        payer = user,
+        space = 8 + UserMints::LEN,
+        seeds = [b"user_mints", fair_launch.key().as_ref(), user.key().as_ref()],
+        bump
+    )]
+    pub user_mints: Account<'info, UserMints>,
+    
+    #[account(mut)]
+    pub user_xnt_account: Account<'info, TokenAccount>,
+    
+    #[account(mut)]
+    pub escrow_xnt_account: Account<'info, TokenAccount>,
+    
+    #[account(mut)]
+    pub user_token_account: Account<'info, TokenAccount>,
+    
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct Graduate<'info> {
+    #[account(
+        mut,
+        seeds = [b"fair_launch", token_mint.key().as_ref()],
+        bump = fair_launch.bump,
+    )]
+    pub fair_launch: Account<'info, FairLaunch>,
+    
+    #[account(mut)]
+    pub token_mint: Account<'info, Mint>,
+    
+    #[account(mut)]
+    pub escrow_xnt_account: Account<'info, TokenAccount>,
+    
+    #[account(mut)]
+    pub creator_xnt_account: Account<'info, TokenAccount>,
+    
+    #[account(mut)]
+    pub platform_xnt_account: Account<'info, TokenAccount>,
+    
+    #[account(mut)]
+    pub platform_token_account: Account<'info, TokenAccount>,
+    
+    #[account(mut)]
+    pub burn_token_account: Account<'info, TokenAccount>,
+    
+    pub token_program: Program<'info, Token>,
+}
+
+#[derive(Accounts)]
+pub struct MarkPoolCreated<'info> {
+    #[account(
+        mut,
+        seeds = [b"fair_launch", fair_launch.token_mint.as_ref()],
+        bump = fair_launch.bump,
+    )]
+    pub fair_launch: Account<'info, FairLaunch>,
+    
+    /// Platform authority
+    pub platform_authority: Signer<'info>,
+}
+
+// ===== STATE =====
+
+#[account]
+pub struct PlatformConfig {
+    pub admin: Pubkey,
+    
+    // Current values
+    pub mint_price: u64,
+    pub target_xnt: u64,
+    pub creation_fee: u64,
+    
+    // Safety limits
+    pub min_mint_price: u64,
+    pub max_mint_price: u64,
+    pub min_target_xnt: u64,
+    pub max_target_xnt: u64,
+    pub min_creation_fee: u64,
+    pub max_creation_fee: u64,
+    
+    pub bump: u8,
+}
+
+impl PlatformConfig {
+    pub const LEN: usize = 
+        32 + // admin
+        8 + // mint_price
+        8 + // target_xnt
+        8 + // creation_fee
+        8 + // min_mint_price
+        8 + // max_mint_price
+        8 + // min_target_xnt
+        8 + // max_target_xnt
+        8 + // min_creation_fee
+        8 + // max_creation_fee
+        1; // bump
+}
+
+#[account]
+pub struct FairLaunch {
+    pub authority: Pubkey,
+    pub token_mint: Pubkey,
+    pub name: String,
+    pub symbol: String,
+    
+    // FIXED token distribution
+    pub total_supply: u64,
+    pub public_supply: u64,
+    pub liquidity_supply: u64,
+    pub platform_supply: u64,
+    pub burn_supply: u64,
+    
+    // Economics from config
+    pub mint_price: u64,
+    pub target_xnt: u64,
+    pub max_per_wallet: u64,
+    
+    // FIXED revenue splits
+    pub creator_xnt_percent: u8,
+    pub platform_xnt_percent: u8,
+    pub pool_xnt_percent: u8,
+    
+    // State
+    pub total_minted: u64,
+    pub xnt_collected: u64,
+    pub graduated: bool,
+    pub pool_created: bool,
+    pub xdex_pool_address: Option<Pubkey>,
+    pub bump: u8,
+}
+
+impl FairLaunch {
+    pub const LEN: usize = 
+        32 + // authority
+        32 + // token_mint
+        (4 + 32) + // name
+        (4 + 10) + // symbol
+        8 + // total_supply
+        8 + // public_supply
+        8 + // liquidity_supply
+        8 + // platform_supply
+        8 + // burn_supply
+        8 + // mint_price
+        8 + // target_xnt
+        8 + // max_per_wallet
+        1 + // creator_xnt_percent
+        1 + // platform_xnt_percent
+        1 + // pool_xnt_percent
+        8 + // total_minted
+        8 + // xnt_collected
+        1 + // graduated
+        1 + // pool_created
+        (1 + 32) + // xdex_pool_address
+        1; // bump
+}
+
+#[account]
+pub struct UserMints {
+    pub user: Pubkey,
+    pub fair_launch: Pubkey,
+    pub amount_minted: u64,
+    pub total_spent: u64,
+}
+
+impl UserMints {
+    pub const LEN: usize = 32 + 32 + 8 + 8;
+}
+
+// ===== EVENTS =====
+
+#[event]
+pub struct ConfigUpdatedEvent {
+    pub admin: Pubkey,
+    pub mint_price: u64,
+    pub target_xnt: u64,
+    pub creation_fee: u64,
+    pub timestamp: i64,
+}
+
+#[event]
+pub struct GraduationEvent {
+    pub token_mint: Pubkey,
+    pub total_xnt: u64,
+    pub creator: Pubkey,
+    pub timestamp: i64,
+}
+
+#[event]
+pub struct PoolReadyEvent {
+    pub token_mint: Pubkey,
+    pub pool_xnt: u64,
+    pub pool_tokens: u64,
+    pub creator: Pubkey,
+    pub platform_token_unlock_time: i64,
+    pub timestamp: i64,
+}
+
+#[event]
+pub struct PoolCreatedEvent {
+    pub token_mint: Pubkey,
+    pub pool_address: Pubkey,
+    pub timestamp: i64,
+}
+
+// ===== ERRORS =====
+
+#[error_code]
+pub enum ErrorCode {
+    #[msg("Unauthorized - Admin only")]
+    Unauthorized,
+    #[msg("Mint price out of allowed range")]
+    PriceOutOfRange,
+    #[msg("Target XNT out of allowed range")]
+    TargetOutOfRange,
+    #[msg("Creation fee out of allowed range")]
+    FeeOutOfRange,
+    #[msg("Invalid max per wallet (must be 1,000-100,000)")]
+    InvalidMaxPerWallet,
+    #[msg("Token name too long (max 32 chars)")]
+    NameTooLong,
+    #[msg("Token symbol too long (max 10 chars)")]
+    SymbolTooLong,
+    #[msg("Token already graduated")]
+    AlreadyGraduated,
+    #[msg("Insufficient supply available")]
+    InsufficientSupply,
+    #[msg("Exceeds wallet limit")]
+    ExceedsWalletLimit,
+    #[msg("Not ready to graduate")]
+    NotReadyToGraduate,
+    #[msg("Not graduated yet")]
+    NotGraduated,
+    #[msg("Already processed")]
+    AlreadyProcessed,
+}
