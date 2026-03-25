@@ -177,7 +177,7 @@ pm2 info fair-launch-backend
 ## 📞 **CONTACTS:**
 
 - **XDEX Team:** Jason @ X1 Blockchain Telegram
-- **Backend Server:** omencult@45.94.81.138:16217
+- **Backend Server:** your-user@YOUR_SERVER_IP:YOUR_SSH_PORT
 - **Service Name:** fair-launch-backend (PM2)
 
 ---

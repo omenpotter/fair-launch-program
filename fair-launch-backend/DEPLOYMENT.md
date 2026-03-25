@@ -52,10 +52,10 @@ npm install
 From your local machine:
 ```bash
 # Transfer wallet (SECURE!)
-scp -P 16217 mainnet-wallet.json omencult@45.94.81.138:~/mainnet-wallet.json
+scp -P YOUR_SSH_PORT mainnet-wallet.json your-user@YOUR_SERVER_IP:~/mainnet-wallet.json
 
 # Transfer IDL
-scp -P 16217 fair_launch_program.json omencult@45.94.81.138:~/fair-launch-backend/
+scp -P YOUR_SSH_PORT fair_launch_program.json your-user@YOUR_SERVER_IP:~/fair-launch-backend/
 ```
 
 On server:
@@ -70,7 +70,7 @@ Create `.env`:
 SOLANA_RPC_URL=https://rpc.mainnet.x1.xyz
 SOLANA_WS_URL=wss://rpc.mainnet.x1.xyz
 PROGRAM_ID=2NWX2Tn5ywkAEUiHxPm5Y28vQAghrDzHcMe78fv2NYye
-PLATFORM_WALLET_PATH=/home/omencult/mainnet-wallet.json
+PLATFORM_WALLET_PATH=/home/your-user/mainnet-wallet.json
 XNT_MINT=So11111111111111111111111111111111111111112
 RETRY_MAX_ATTEMPTS=5
 RETRY_INITIAL_DELAY_MS=1000
@@ -168,5 +168,5 @@ pm2 restart fair-launch-backend
 ## 📞 Support
 
 - GitHub: https://github.com/omenpotter/fair-launch-program
-- Server: omencult@45.94.81.138:16217
+- Server: your-user@YOUR_SERVER_IP:YOUR_SSH_PORT
 - Service: fair-launch-backend (PM2)
