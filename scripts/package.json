@@ -1,0 +1,12 @@
+{
+  "name": "fair-launch-scripts",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "init": "node initialize-platform.js"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.30.1",
+    "@solana/web3.js": "^1.95.0"
+  }
+}

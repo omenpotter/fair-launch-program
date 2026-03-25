@@ -5,3 +5,12 @@ target
 node_modules
 test-ledger
 .yarn
+
+# Sensitive deployment info
+deployment-secrets.txt
+server-info.txt
+*.keypair
+*.key
+
+# Private notes
+PRIVATE_*.md

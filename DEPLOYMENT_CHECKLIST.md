@@ -104,7 +104,7 @@ Comprehensive checklist for deploying and operating the Fair Launch platform.
 
 ### **Server Setup**
 - [x] Server access configured
-- [x] Server: `omencult@45.94.81.138:16217`
+- [x] Server: `your-user@YOUR_SERVER_IP:YOUR_SSH_PORT`
 - [x] Node.js installed (v22.21.0)
 - [x] PM2 installed
 - [x] Project directory created: `~/fair-launch-backend`
@@ -371,7 +371,7 @@ Comprehensive checklist for deploying and operating the Fair Launch platform.
 
 ### **Team**
 - **Admin Wallet:** C5V1AaFcE8WSEWaC6gb1w3mcXd3JbdgJ7yXYBuoxphGZ
-- **Backend Server:** omencult@45.94.81.138:16217
+- **Backend Server:** your-user@YOUR_SERVER_IP:YOUR_SSH_PORT
 - **PM2 Service:** fair-launch-backend
 
 ### **External**
