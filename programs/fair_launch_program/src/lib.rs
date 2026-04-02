@@ -103,6 +103,54 @@ pub mod fair_launch_program {
         Ok(())
     }
 
+/// Update safety limits (admin only)
+    /// Allows adjusting min/max bounds for price, target, and fees
+    pub fn update_safety_limits(
+        ctx: Context<UpdatePlatformConfig>,
+        new_min_target_xnt: Option<u64>,
+        new_max_target_xnt: Option<u64>,
+        new_min_mint_price: Option<u64>,
+        new_max_mint_price: Option<u64>,
+    ) -> Result<()> {
+        let config = &mut ctx.accounts.platform_config;
+        
+        // Validate admin
+        require!(
+            ctx.accounts.admin.key() == config.admin,
+            ErrorCode::Unauthorized
+        );
+        
+        // Update min_target_xnt if provided
+        if let Some(min_target) = new_min_target_xnt {
+            let old_min = config.min_target_xnt;
+            config.min_target_xnt = min_target;
+            msg!("Min target XNT updated: {} -> {} lamports", old_min, min_target);
+        }
+        
+        // Update max_target_xnt if provided
+        if let Some(max_target) = new_max_target_xnt {
+            let old_max = config.max_target_xnt;
+            config.max_target_xnt = max_target;
+            msg!("Max target XNT updated: {} -> {} lamports", old_max, max_target);
+        }
+        
+        // Update min_mint_price if provided
+        if let Some(min_price) = new_min_mint_price {
+            let old_min = config.min_mint_price;
+            config.min_mint_price = min_price;
+            msg!("Min mint price updated: {} -> {} lamports", old_min, min_price);
+        }
+        
+        // Update max_mint_price if provided
+        if let Some(max_price) = new_max_mint_price {
+            let old_max = config.max_mint_price;
+            config.max_mint_price = max_price;
+            msg!("Max mint price updated: {} -> {} lamports", old_max, max_price);
+        }
+        
+        Ok(())
+    }
+
     /// Initialize a new fair launch token
     pub fn initialize(
         ctx: Context<Initialize>,
@@ -174,13 +222,15 @@ pub mod fair_launch_program {
             ErrorCode::InsufficientSupply
         );
         
-        // Check per-wallet limit
+// Check per-wallet limit (0 = unlimited)
         let user_mints = &mut ctx.accounts.user_mints;
-        require!(
-            user_mints.amount_minted + amount <= fair_launch.max_per_wallet,
-            ErrorCode::ExceedsWalletLimit
-        );
-        
+        if fair_launch.max_per_wallet > 0 {
+            require!(
+                user_mints.amount_minted + amount <= fair_launch.max_per_wallet,
+                ErrorCode::ExceedsWalletLimit
+            );
+        }
+        // If max_per_wallet == 0, no limit check (unlimited minting)
         // Calculate XNT cost
         let xnt_cost = (amount as u128)
             .checked_mul(fair_launch.mint_price as u128)
@@ -426,7 +476,7 @@ pub struct Initialize<'info> {
     #[account(
         init,
         payer = authority,
-        mint::decimals = 9,
+        mint::decimals = 0,
         mint::authority = fair_launch,
     )]
     pub token_mint: Account<'info, Mint>,
