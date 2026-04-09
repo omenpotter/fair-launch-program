@@ -158,7 +158,7 @@ pub mod fair_launch_program {
         symbol: String,
         max_per_wallet: u64,
     ) -> Result<()> {
-        require!(max_per_wallet == 0 || (max_per_wallet >= 1_000 && max_per_wallet <= 100_000), ErrorCode::InvalidMaxPerWallet);
+        require!(max_per_wallet >= 1_000 && max_per_wallet <= 100_000, ErrorCode::InvalidMaxPerWallet);
         require!(name.len() <= 32, ErrorCode::NameTooLong);
         require!(symbol.len() <= 10, ErrorCode::SymbolTooLong);
         
@@ -230,7 +230,8 @@ pub mod fair_launch_program {
                 ErrorCode::ExceedsWalletLimit
             );
         }
-        // If max_per_wallet == 0, no limit check (unlimited minting)        // Calculate XNT cost
+        // If max_per_wallet == 0, no limit check (unlimited minting)
+        // Calculate XNT cost
         let xnt_cost = (amount as u128)
             .checked_mul(fair_launch.mint_price as u128)
             .unwrap() as u64;
@@ -396,128 +397,6 @@ pub mod fair_launch_program {
         Ok(())
     }
 
-
-    /// Create XDEX pool using escrow funds (backend calls this after graduation)
-    pub fn create_xdex_pool(
-        ctx: Context<CreateXdexPool>,
-        init_amount_xnt: u64,
-        init_amount_tokens: u64,
-        open_time: u64,
-    ) -> Result<()> {
-        let fair_launch = &mut ctx.accounts.fair_launch;
-
-        require!(fair_launch.graduated, ErrorCode::NotGraduated);
-        require!(!fair_launch.pool_created, ErrorCode::AlreadyProcessed);
-
-        let token_mint_key = fair_launch.token_mint;
-        let bump = fair_launch.bump;
-        let seeds = &[
-            b"fair_launch",
-            token_mint_key.as_ref(),
-            &[bump],
-        ];
-        let signer = &[&seeds[..]];
-
-        // 1. Transfer WSOL from escrow (fair_launch's ATA) to payer's WSOL ATA
-        let cpi_accounts = Transfer {
-            from: ctx.accounts.escrow_xnt_account.to_account_info(),
-            to: ctx.accounts.creator_token0.to_account_info(),
-            authority: fair_launch.to_account_info(),
-        };
-        let cpi_ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.to_account_info(),
-            cpi_accounts,
-            signer,
-        );
-        token::transfer(cpi_ctx, init_amount_xnt)?;
-
-        // 2. Mint liquidity tokens into payer's token account
-        let cpi_accounts = MintTo {
-            mint: ctx.accounts.token_mint.to_account_info(),
-            to: ctx.accounts.creator_token1.to_account_info(),
-            authority: fair_launch.to_account_info(),
-        };
-        let cpi_ctx = CpiContext::new_with_signer(
-            ctx.accounts.token_program.to_account_info(),
-            cpi_accounts,
-            signer,
-        );
-        token::mint_to(cpi_ctx, init_amount_tokens)?;
-
-        // 2. CPI to xDEX initialize
-        // discriminator = sha256("global:initialize")[0:8] = afaf6d1f0d989bed
-        let disc: [u8; 8] = [0xaf, 0xaf, 0x6d, 0x1f, 0x0d, 0x98, 0x9b, 0xed];
-        let mut ix_data = disc.to_vec();
-        ix_data.extend_from_slice(&init_amount_xnt.to_le_bytes());
-        ix_data.extend_from_slice(&init_amount_tokens.to_le_bytes());
-        ix_data.extend_from_slice(&open_time.to_le_bytes());
-
-        let ix = anchor_lang::solana_program::instruction::Instruction {
-            program_id: ctx.accounts.xdex_program.key(),
-            accounts: vec![
-                anchor_lang::solana_program::instruction::AccountMeta::new(ctx.accounts.payer.key(), true),
-                anchor_lang::solana_program::instruction::AccountMeta::new_readonly(ctx.accounts.amm_config.key(), false),
-                anchor_lang::solana_program::instruction::AccountMeta::new_readonly(ctx.accounts.xdex_authority.key(), false),
-                anchor_lang::solana_program::instruction::AccountMeta::new(ctx.accounts.pool_state.key(), false),
-                anchor_lang::solana_program::instruction::AccountMeta::new_readonly(ctx.accounts.token0_mint.key(), false),
-                anchor_lang::solana_program::instruction::AccountMeta::new_readonly(ctx.accounts.token1_mint.key(), false),
-                anchor_lang::solana_program::instruction::AccountMeta::new(ctx.accounts.lp_mint.key(), false),
-                anchor_lang::solana_program::instruction::AccountMeta::new(ctx.accounts.creator_token0.key(), false),
-                anchor_lang::solana_program::instruction::AccountMeta::new(ctx.accounts.creator_token1.key(), false),
-                anchor_lang::solana_program::instruction::AccountMeta::new(ctx.accounts.creator_lp_token.key(), false),
-                anchor_lang::solana_program::instruction::AccountMeta::new(ctx.accounts.token0_vault.key(), false),
-                anchor_lang::solana_program::instruction::AccountMeta::new(ctx.accounts.token1_vault.key(), false),
-                anchor_lang::solana_program::instruction::AccountMeta::new(ctx.accounts.create_pool_fee.key(), false),
-                anchor_lang::solana_program::instruction::AccountMeta::new(ctx.accounts.observation_state.key(), false),
-                anchor_lang::solana_program::instruction::AccountMeta::new_readonly(ctx.accounts.token_program.key(), false),
-                anchor_lang::solana_program::instruction::AccountMeta::new_readonly(ctx.accounts.token_program.key(), false),
-                anchor_lang::solana_program::instruction::AccountMeta::new_readonly(ctx.accounts.token_program.key(), false),
-                anchor_lang::solana_program::instruction::AccountMeta::new_readonly(ctx.accounts.associated_token_program.key(), false),
-                anchor_lang::solana_program::instruction::AccountMeta::new_readonly(ctx.accounts.system_program.key(), false),
-                anchor_lang::solana_program::instruction::AccountMeta::new_readonly(ctx.accounts.rent.key(), false),
-            ],
-            data: ix_data,
-        };
-
-        let account_infos = vec![
-            ctx.accounts.payer.to_account_info(),
-            ctx.accounts.amm_config.to_account_info(),
-            ctx.accounts.xdex_authority.to_account_info(),
-            ctx.accounts.pool_state.to_account_info(),
-            ctx.accounts.token0_mint.to_account_info(),
-            ctx.accounts.token1_mint.to_account_info(),
-            ctx.accounts.lp_mint.to_account_info(),
-            ctx.accounts.creator_token0.to_account_info(),
-            ctx.accounts.creator_token1.to_account_info(),
-            ctx.accounts.creator_lp_token.to_account_info(),
-            ctx.accounts.token0_vault.to_account_info(),
-            ctx.accounts.token1_vault.to_account_info(),
-            ctx.accounts.create_pool_fee.to_account_info(),
-            ctx.accounts.observation_state.to_account_info(),
-            ctx.accounts.token_program.to_account_info(),
-            ctx.accounts.associated_token_program.to_account_info(),
-            ctx.accounts.system_program.to_account_info(),
-            ctx.accounts.rent.to_account_info(),
-        ];
-
-        // payer signs as creator, fair_launch signs as mint authority (already done above)
-        anchor_lang::solana_program::program::invoke(&ix, &account_infos)?;
-
-        // 3. Mark pool as created
-        fair_launch.pool_created = true;
-        fair_launch.xdex_pool_address = Some(ctx.accounts.pool_state.key());
-
-        msg!("✅ XDEX pool created: {}", ctx.accounts.pool_state.key());
-
-        emit!(PoolCreatedEvent {
-            token_mint: fair_launch.token_mint,
-            pool_address: ctx.accounts.pool_state.key(),
-            timestamp: Clock::get()?.unix_timestamp,
-        });
-
-        Ok(())
-    }
-
     /// Mark pool as created (called by backend after XDEX pool creation)
     pub fn mark_pool_created(
         ctx: Context<MarkPoolCreated>,
@@ -623,7 +502,7 @@ pub struct MintTokens<'info> {
     pub token_mint: Account<'info, Mint>,
     
     #[account(
-        init_if_needed,
+        init,
         payer = user,
         space = 8 + UserMints::LEN,
         seeds = [b"user_mints", fair_launch.key().as_ref(), user.key().as_ref()],
@@ -672,69 +551,6 @@ pub struct Graduate<'info> {
     pub burn_token_account: Account<'info, TokenAccount>,
     
     pub token_program: Program<'info, Token>,
-}
-
-
-#[derive(Accounts)]
-pub struct CreateXdexPool<'info> {
-    #[account(mut)]
-    pub payer: Signer<'info>,
-
-    #[account(
-        mut,
-        seeds = [b"fair_launch", token_mint.key().as_ref()],
-        bump = fair_launch.bump,
-    )]
-    pub fair_launch: Account<'info, FairLaunch>,
-
-    #[account(mut)]
-    pub token_mint: Account<'info, Mint>,
-
-    /// CHECK: xDEX AMM config
-    pub amm_config: UncheckedAccount<'info>,
-    /// CHECK: xDEX authority PDA
-    pub xdex_authority: UncheckedAccount<'info>,
-    /// CHECK: Pool state PDA (created by xDEX)
-    #[account(mut)]
-    pub pool_state: UncheckedAccount<'info>,
-    /// CHECK: token0 mint (WSOL)
-    pub token0_mint: UncheckedAccount<'info>,
-    /// CHECK: token1 mint (our token)
-    pub token1_mint: UncheckedAccount<'info>,
-    /// CHECK: LP mint PDA (created by xDEX)
-    #[account(mut)]
-    pub lp_mint: UncheckedAccount<'info>,
-    /// CHECK: Escrow WSOL account (B4sgiX, owned by fair_launch PDA)
-    #[account(mut)]
-    pub escrow_xnt_account: UncheckedAccount<'info>,
-    /// CHECK: Creator (payer) WSOL ATA
-    #[account(mut)]
-    pub creator_token0: UncheckedAccount<'info>,
-    /// CHECK: Creator token ATA (fair_launch PDA owns this)
-    #[account(mut)]
-    pub creator_token1: UncheckedAccount<'info>,
-    /// CHECK: Creator LP token ATA (will be created by xDEX)
-    #[account(mut)]
-    pub creator_lp_token: UncheckedAccount<'info>,
-    /// CHECK: WSOL vault (created by xDEX)
-    #[account(mut)]
-    pub token0_vault: UncheckedAccount<'info>,
-    /// CHECK: Token vault (created by xDEX)
-    #[account(mut)]
-    pub token1_vault: UncheckedAccount<'info>,
-    /// CHECK: Pool creation fee receiver (SKc6b6z...)
-    #[account(mut)]
-    pub create_pool_fee: UncheckedAccount<'info>,
-    /// CHECK: Observation state PDA (created by xDEX)
-    #[account(mut)]
-    pub observation_state: UncheckedAccount<'info>,
-    /// CHECK: xDEX program
-    pub xdex_program: UncheckedAccount<'info>,
-    pub token_program: Program<'info, Token>,
-    /// CHECK: Associated token program
-    pub associated_token_program: UncheckedAccount<'info>,
-    pub system_program: Program<'info, System>,
-    pub rent: Sysvar<'info, Rent>,
 }
 
 #[derive(Accounts)]
@@ -924,6 +740,3 @@ pub enum ErrorCode {
     #[msg("Already processed")]
     AlreadyProcessed,
 }
-
-// ===== XDEX POOL CREATION =====
-// Added to lib.rs end - will be moved into proper position after testing
